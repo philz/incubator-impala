@@ -76,7 +76,14 @@ then
   exit 1
 fi
 
+JDK_VERSION=8
+if [[ $DISTRIB_RELEASE = 14.04 ]]
+then
+  JDK_VERSION=7
+fi
+
 REAL_APT_GET=$(which apt-get)
+
 function apt-get {
   for ITER in $(seq 1 20); do
     echo "ATTEMPT: ${ITER}"
@@ -90,131 +97,149 @@ function apt-get {
   return 1
 }
 
-apt-get update
-apt-get --yes install apt-utils
-apt-get --yes install git
+function install-packages {
+  apt-get update
+  apt-get --yes install apt-utils git ccache g++ gcc libffi-dev liblzo2-dev libkrb5-dev \
+        libsasl2-dev libssl-dev make maven ninja-build ntp ntpdate python-dev \
+        python-setuptools postgresql ssh wget vim-common \
+        openjdk-${JDK_VERSION}-jdk openjdk-${JDK_VERSION}-source
+}
 
-# If there is no Impala git repo, get one now
-if ! [[ -d ~/Impala ]]
-then
-  time -p git clone https://git-wip-us.apache.org/repos/asf/incubator-impala.git ~/Impala
+function checkout-impala {
+  # If there is no Impala git repo, get one now
+  if ! [[ -d ~/Impala ]]
+  then
+    time -p git clone https://git-wip-us.apache.org/repos/asf/incubator-impala.git ~/Impala
+  fi
+
+  # LZO is not needed to compile or run Impala, but it is needed for the data load
+  if ! [[ -d ~/Impala-lzo ]]
+  then
+    git clone https://github.com/cloudera/impala-lzo.git ~/Impala-lzo
+  fi
+  if ! [[ -d ~/hadoop-lzo ]]
+  then
+    git clone https://github.com/cloudera/hadoop-lzo.git ~/hadoop-lzo
+  fi
+}
+
+function configure {
+  cd ~/Impala
+  SET_IMPALA_HOME="export IMPALA_HOME=$(pwd)"
+  echo "$SET_IMPALA_HOME" >> ~/.bashrc
+  eval "$SET_IMPALA_HOME"
+
+  if ! { service --status-all | grep -E '^ \[ \+ \]  ssh$'; }
+  then
+    sudo service ssh start
+  fi
+
+  # TODO: config ccache to give it plenty of space
+  # TODO: check that there is enough space on disk to do a build and data load
+  # TODO: make this work with non-bash shells
+
+  SET_JAVA_HOME="export JAVA_HOME=/usr/lib/jvm/java-${JDK_VERSION}-openjdk-amd64"
+  echo "$SET_JAVA_HOME" >> "${IMPALA_HOME}/bin/impala-config-local.sh"
+  eval "$SET_JAVA_HOME"
+
+  sudo service ntp stop
+  sudo ntpdate us.pool.ntp.org
+  # If on EC2, use Amazon's ntp servers
+  if which dmidecode && { sudo dmidecode -s bios-version | grep amazon; }
+  then
+    sudo sed -i 's/ubuntu\.pool/amazon\.pool/' /etc/ntp.conf
+    grep amazon /etc/ntp.conf
+    grep ubuntu /etc/ntp.conf
+  fi
+  # While it is nice to have ntpd running to keep the clock in sync, that does not work in a
+  # --privileged docker container, and a non-privileged container cannot run ntpdate, which
+  # is strictly needed by Kudu.
+  # TODO: Make privileged docker start ntpd
+  sudo service ntp start || grep docker /proc/1/cgroup
+
+  # IMPALA-3932, IMPALA-3926
+  if [[ $DISTRIB_RELEASE = 16.04 ]]
+  then
+    SET_LD_LIBRARY_PATH='export LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu/${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}'
+  elif [[ $DISTRIB_RELEASE = 14.04 ]]
+  then
+    SET_LD_LIBRARY_PATH="unset LD_LIBRARY_PATH"
+  fi
+  echo "$SET_LD_LIBRARY_PATH" >> "${IMPALA_HOME}/bin/impala-config-local.sh"
+  eval "$SET_LD_LIBRARY_PATH"
+
+  # TODO: What are the security implications of this?
+  for PG_AUTH_FILE in /etc/postgresql/*/main/pg_hba.conf
+  do
+    sudo sed -ri 's/local +all +all +peer/local all all trust/g' $PG_AUTH_FILE
+  done
+  sudo service postgresql restart
+  sudo /etc/init.d/postgresql reload
+  sudo service postgresql restart
+
+  # Set up postgress for HMS
+  if ! [[ 1 = $(sudo -u postgres psql -At -c "SELECT count(*) FROM pg_roles WHERE rolname = 'hiveuser';") ]]
+  then
+    sudo -u postgres psql -c "CREATE ROLE hiveuser LOGIN PASSWORD 'password';"
+  fi
+  sudo -u postgres psql -c "ALTER ROLE hiveuser WITH CREATEDB;"
+  sudo -u postgres psql -c "SELECT * FROM pg_roles WHERE rolname = 'hiveuser';"
+
+  # Setup ssh to ssh to localhost
+  mkdir -p ~/.ssh
+  chmod go-rwx ~/.ssh
+  if ! [[ -f ~/.ssh/id_rsa ]]
+  then
+    ssh-keygen -t rsa -N '' -q -f ~/.ssh/id_rsa
+  fi
+  cat ~/.ssh/id_rsa.pub >> ~/.ssh/authorized_keys
+  echo "NoHostAuthenticationForLocalhost yes" >> ~/.ssh/config
+  ssh localhost whoami
+
+  # Workarounds for HDFS networking issues
+  echo "127.0.0.1 $(hostname -s) $(hostname)" | sudo tee -a /etc/hosts
+  # In Docker, one can change /etc/hosts as above but not with sed -i. The error message is
+  # "sed: cannot rename /etc/sedc3gPj8: Device or resource busy". The following lines are
+  # basically sed -i but with cp instead of mv for -i part.
+  NEW_HOSTS=$(mktemp)
+  sed 's/127.0.1.1/127.0.0.1/g' /etc/hosts > "${NEW_HOSTS}"
+  diff -u /etc/hosts "${NEW_HOSTS}" || true
+  sudo cp "${NEW_HOSTS}" /etc/hosts
+  rm "${NEW_HOSTS}"
+
+  sudo mkdir -p /var/lib/hadoop-hdfs
+  sudo chown $(whoami) /var/lib/hadoop-hdfs/
+
+  # TODO: restrict this to only the users it is needed for
+  echo "* - nofile 1048576" | sudo tee -a /etc/security/limits.conf
+}
+
+function build {
+  cd ~/hadoop-lzo/
+  time -p ant package
+  cd "$IMPALA_HOME"
+
+  export MAX_PYTEST_FAILURES=0
+  source bin/impala-config.sh
+  export NUM_CONCURRENT_TESTS=$(nproc)
+  time -p ./buildall.sh -noclean -format -testdata -skiptests
+
+  # To then run the tests:
+  # time -p bin/run-all-tests.sh
+}
+
+
+if [[ $# -eq 0 ]]; then
+  install-packages
+  echo X: $SECONDS
+  checkout-impala
+  echo X: $SECONDS
+  configure
+  echo X: $SECONDS
+  build
+  echo X: $SECONDS
+else
+  for a in $@; do
+    $a
+  done
 fi
-cd ~/Impala
-SET_IMPALA_HOME="export IMPALA_HOME=$(pwd)"
-echo "$SET_IMPALA_HOME" >> ~/.bashrc
-eval "$SET_IMPALA_HOME"
-
-apt-get --yes install ccache g++ gcc libffi-dev liblzo2-dev libkrb5-dev libsasl2-dev \
-        libssl-dev make maven ninja-build ntp ntpdate python-dev python-setuptools \
-        postgresql ssh wget vim-common
-
-if ! { service --status-all | grep -E '^ \[ \+ \]  ssh$'; }
-then
-  sudo service ssh start
-fi
-
-# TODO: config ccache to give it plenty of space
-# TODO: check that there is enough space on disk to do a build and data load
-# TODO: make this work with non-bash shells
-
-JDK_VERSION=8
-if [[ $DISTRIB_RELEASE = 14.04 ]]
-then
-  JDK_VERSION=7
-fi
-apt-get --yes install openjdk-${JDK_VERSION}-jdk openjdk-${JDK_VERSION}-source
-SET_JAVA_HOME="export JAVA_HOME=/usr/lib/jvm/java-${JDK_VERSION}-openjdk-amd64"
-echo "$SET_JAVA_HOME" >> "${IMPALA_HOME}/bin/impala-config-local.sh"
-eval "$SET_JAVA_HOME"
-
-sudo service ntp stop
-sudo ntpdate us.pool.ntp.org
-# If on EC2, use Amazon's ntp servers
-if which dmidecode && { sudo dmidecode -s bios-version | grep amazon; }
-then
-  sudo sed -i 's/ubuntu\.pool/amazon\.pool/' /etc/ntp.conf
-  grep amazon /etc/ntp.conf
-  grep ubuntu /etc/ntp.conf
-fi
-# While it is nice to have ntpd running to keep the clock in sync, that does not work in a
-# --privileged docker container, and a non-privileged container cannot run ntpdate, which
-# is strictly needed by Kudu.
-# TODO: Make privileged docker start ntpd
-sudo service ntp start || grep docker /proc/1/cgroup
-
-# IMPALA-3932, IMPALA-3926
-if [[ $DISTRIB_RELEASE = 16.04 ]]
-then
-  SET_LD_LIBRARY_PATH='export LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu/${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}'
-elif [[ $DISTRIB_RELEASE = 14.04 ]]
-then
-  SET_LD_LIBRARY_PATH="unset LD_LIBRARY_PATH"
-fi
-echo "$SET_LD_LIBRARY_PATH" >> "${IMPALA_HOME}/bin/impala-config-local.sh"
-eval "$SET_LD_LIBRARY_PATH"
-
-# TODO: What are the security implications of this?
-for PG_AUTH_FILE in /etc/postgresql/*/main/pg_hba.conf
-do
-  sudo sed -ri 's/local +all +all +peer/local all all trust/g' $PG_AUTH_FILE
-done
-sudo service postgresql restart
-sudo /etc/init.d/postgresql reload
-sudo service postgresql restart
-
-# Set up postgress for HMS
-if ! [[ 1 = $(sudo -u postgres psql -At -c "SELECT count(*) FROM pg_roles WHERE rolname = 'hiveuser';") ]]
-then
-  sudo -u postgres psql -c "CREATE ROLE hiveuser LOGIN PASSWORD 'password';"
-fi
-sudo -u postgres psql -c "ALTER ROLE hiveuser WITH CREATEDB;"
-sudo -u postgres psql -c "SELECT * FROM pg_roles WHERE rolname = 'hiveuser';"
-
-# Setup ssh to ssh to localhost
-mkdir -p ~/.ssh
-chmod go-rwx ~/.ssh
-if ! [[ -f ~/.ssh/id_rsa ]]
-then
-  ssh-keygen -t rsa -N '' -q -f ~/.ssh/id_rsa
-fi
-cat ~/.ssh/id_rsa.pub >> ~/.ssh/authorized_keys
-echo "NoHostAuthenticationForLocalhost yes" >> ~/.ssh/config
-ssh localhost whoami
-
-# Workarounds for HDFS networking issues
-echo "127.0.0.1 $(hostname -s) $(hostname)" | sudo tee -a /etc/hosts
-# In Docker, one can change /etc/hosts as above but not with sed -i. The error message is
-# "sed: cannot rename /etc/sedc3gPj8: Device or resource busy". The following lines are
-# basically sed -i but with cp instead of mv for -i part.
-NEW_HOSTS=$(mktemp)
-sed 's/127.0.1.1/127.0.0.1/g' /etc/hosts > "${NEW_HOSTS}"
-diff -u /etc/hosts "${NEW_HOSTS}" || true
-sudo cp "${NEW_HOSTS}" /etc/hosts
-rm "${NEW_HOSTS}"
-
-sudo mkdir -p /var/lib/hadoop-hdfs
-sudo chown $(whoami) /var/lib/hadoop-hdfs/
-
-# TODO: restrict this to only the users it is needed for
-echo "* - nofile 1048576" | sudo tee -a /etc/security/limits.conf
-
-# LZO is not needed to compile or run Impala, but it is needed for the data load
-if ! [[ -d ~/Impala-lzo ]]
-then
-  git clone https://github.com/cloudera/impala-lzo.git ~/Impala-lzo
-fi
-if ! [[ -d ~/hadoop-lzo ]]
-then
-  git clone https://github.com/cloudera/hadoop-lzo.git ~/hadoop-lzo
-fi
-cd ~/hadoop-lzo/
-time -p ant package
-cd "$IMPALA_HOME"
-
-export MAX_PYTEST_FAILURES=0
-source bin/impala-config.sh
-export NUM_CONCURRENT_TESTS=$(nproc)
-time -p ./buildall.sh -noclean -format -testdata -skiptests
-
-# To then run the tests:
-# time -p bin/run-all-tests.sh
